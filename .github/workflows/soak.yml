@@ -1,0 +1,76 @@
+# Soak test: long-running jobs on the self-hosted scale set.
+# Three parallel jobs against a scale set capped at two runners, so the third
+# job must queue until a runner frees up. Each job keeps Postgres and the
+# Docker daemon busy for N minutes and checks both stay healthy.
+name: soak test
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Soak duration per job, in minutes
+        default: "6"
+
+jobs:
+  soak:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3]
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Identity
+        run: |
+          echo "job ${{ matrix.n }} started $(date -u +%T)"
+          echo "runner: $RUNNER_NAME  host: $(hostname)  arch: $(uname -m)"
+          nproc; free -m | sed -n 2p; df -h / | tail -1
+
+      - uses: actions/checkout@v4
+
+      - name: Postgres client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client >/dev/null
+
+      - name: Soak
+        env:
+          PGPASSWORD: ci
+          MINUTES: ${{ inputs.minutes || '6' }}
+        run: |
+          psql -h localhost -U ci -d ci -qc 'create table beat(i int, at timestamptz default now())'
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          i=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            i=$((i + 1))
+            timeout 10 sh -c 'while :; do :; done' || true     # ten seconds of one busy core
+            psql -h localhost -U ci -d ci -qc "insert into beat(i) values ($i)"
+            docker info >/dev/null
+            echo "[$i] $(date -u +%T) load=$(cut -d' ' -f1-3 /proc/loadavg) rows=$(psql -h localhost -U ci -d ci -tAc 'select count(*) from beat') dind=ok"
+            sleep 20
+          done
+          rows=$(psql -h localhost -U ci -d ci -tAc 'select count(*) from beat')
+          test "$rows" = "$i"
+          echo "soak finished: $i heartbeats, $rows rows"
+
+      - name: Network and image build after the soak
+        run: |
+          curl -fsSI https://registry.npmjs.org | head -1
+          mkdir img && printf 'FROM alpine:3.21\nRUN apk add --no-cache curl && echo built-on-$(uname -m)\n' > img/Dockerfile
+          docker build -q -t soak:local img
+          docker run --rm soak:local curl --version | head -1
+          echo "job ${{ matrix.n }} finished $(date -u +%T)"
