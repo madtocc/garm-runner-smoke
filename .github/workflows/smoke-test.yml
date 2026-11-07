@@ -1,0 +1,94 @@
+# Smoke test for the self-hosted runners. Exercises exactly what this org's
+# workflows need: checkout, Node 22, a Postgres `services:` container with a
+# health check, sudo, and a buildx build with the GitHub Actions cache.
+#
+# Copy to .github/workflows/smoke-test.yml in a PRIVATE scratch repository
+# (docs/first-run.md) and run it from the Actions tab.
+name: runner smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    # Repository/org variable CI_RUNNER = pellar-linux switches the job to the
+    # self-hosted scale set; unset, it stays on GitHub's runners. Verify on the
+    # first live run: if GitHub rejects the expression in runs-on, replace it
+    # with the plain scale-set name:   runs-on: pellar-linux
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host facts
+        run: |
+          uname -m
+          nproc
+          free -h
+          cat /etc/os-release | grep PRETTY_NAME
+          docker info --format 'Docker server {{.ServerVersion}}'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Node 22 works
+        run: |
+          node --version
+          node -e 'console.log("hello from", process.arch)'
+
+      - name: sudo works
+        run: |
+          sudo true
+          sudo mkdir -p /opt/smoke-test
+          sudo sh -c 'echo ok > /opt/smoke-test/marker'
+          test "$(cat /opt/smoke-test/marker)" = ok
+
+      - name: Postgres service is reachable on localhost:5432
+        env:
+          PGPASSWORD: ci
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client >/dev/null
+          pg_isready -h localhost -p 5432 -U ci
+          psql -h localhost -p 5432 -U ci -d ci -c 'select version();'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Inline Dockerfile for the build test
+        run: |
+          mkdir -p smoke-image
+          cat > smoke-image/Dockerfile <<'DOCKERFILE'
+          FROM alpine:3.21
+          RUN echo "built on $(uname -m) at $(date -u)" > /built.txt
+          CMD ["cat", "/built.txt"]
+          DOCKERFILE
+
+      - name: buildx build with GHA cache
+        uses: docker/build-push-action@v5
+        with:
+          context: smoke-image
+          push: false
+          load: true
+          tags: smoke-test:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Built image runs
+        run: docker run --rm smoke-test:local
