@@ -1,0 +1,14 @@
+{
+  "name": "runner-shape-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.8.0",
+  "engines": { "node": ">=22.23.1", "pnpm": ">=11.8.0" },
+  "scripts": { "test": "vitest run", "typecheck": "tsc --noEmit -p tsconfig.json" },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  }
+}

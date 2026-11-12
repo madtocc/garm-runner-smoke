@@ -1,0 +1,109 @@
+# Synthetic stand-in for a pnpm 11 monorepo CI: the step shapes that differ
+# from the basic smoke test (pnpm 11 on the persistent store, docker compose
+# with a workspace bind mount, Foundry, Terraform, an emulated image build).
+name: monorepo-shape
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Three consecutive jobs against one persistent pnpm store volume.
+  pnpm11:
+    name: pnpm 11 install (pass ${{ matrix.pass }})
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        pass: [1, 2, 3]
+    runs-on: pellar-linux
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.23.1"
+          cache: pnpm
+      - name: pnpm binary is intact
+        run: |
+          set -eux
+          uname -m; nproc; free -m | sed -n 2p
+          test -s "$(readlink -f "$(command -v pnpm)")"
+          test "$(pnpm --version)" = "11.8.0"
+          node --version
+          pnpm store path
+          env | grep -i -E '^(pnpm|npm)_config|^PNPM_HOME' || true
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --reporter=append-only
+      - name: Import method
+        run: pnpm config get package-import-method || true
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  compose:
+    name: docker compose with a workspace bind mount
+    runs-on: pellar-linux
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start infrastructure
+        working-directory: shape
+        run: docker compose up -d --wait
+      - name: Verify
+        working-directory: shape
+        run: |
+          set -eux
+          docker compose ps
+          # The init script is a bind mount of a workspace file: it only runs
+          # if the job's Docker daemon can see the runner's workspace path.
+          test "$(docker compose exec -T postgres psql -U postgres -tAc "select count(*) from pg_roles where rolname='app_user'")" = 1
+          test "$(docker compose exec -T postgres psql -U postgres -tAc "select count(*) from pg_database where datname='smoke_test'")" = 1
+          # Published ports answer on the runner's own localhost.
+          (exec 3<>/dev/tcp/127.0.0.1/5432) && echo "5432 open on 127.0.0.1"
+          (exec 3<>/dev/tcp/localhost/6379) && echo "6379 open on localhost"
+          docker compose port postgres 5432
+          docker run --rm --network host postgres:16-alpine \
+            psql "postgresql://app_user:app@127.0.0.1:5432/smoke_test" -tAc "select 'app_user over localhost ok'"
+      - name: Second port when 5432 is taken
+        working-directory: shape
+        run: |
+          set -eux
+          POSTGRES_HOST_PORT=15432 REDIS_HOST_PORT=16379 docker compose -p second up -d --wait
+          (exec 3<>/dev/tcp/127.0.0.1/15432) && echo "15432 open"
+
+  tools:
+    name: Foundry and Terraform
+    runs-on: pellar-linux
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - run: forge --version
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.10.5"
+      - run: terraform version
+      - name: Host tools the scripts fall back on
+        run: |
+          for t in git jq curl awk sed sha1sum cksum lsof fuser psql python3 unzip xz; do
+            printf '%-8s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+
+  # The mirror image of building linux/arm64 on an x86_64 VPS: an image build
+  # for the other architecture through QEMU inside the job's own daemon.
+  emulated-build:
+    name: Cross-architecture image build (QEMU)
+    runs-on: pellar-linux
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: shape
+          file: shape/emulated.Dockerfile
+          platforms: linux/amd64
+          push: false
